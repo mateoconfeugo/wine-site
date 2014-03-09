@@ -1,52 +1,86 @@
-(ns wine-site.dev-ops.crate.harves
-  (:require [net.cgrand.enlive-html :as html])
-;;  (:use [clojure.contrib.seq-utils :only [indexed]]
-;;        [clojure.contrib.str-utils :only [re-sub re-gsub]]
-  )
+(ns wine-site.dev-ops.crate.harvest
+  (:require [clojure.core.async  :refer [put! >! chan go <!!]]
+            [clojure.edn]
+            [com.ashafa.clutch :as clutch]
+            [net.cgrand.enlive-html :as html]
+            [clojure.core.match :refer [match]]
+            [clojurewerkz.urly.core :refer [query-of]]
+            [pallet.api :refer [group-spec lift]]
+            [pallet.crate :refer [defplan]]))
 
-(def *base-url* "http://pasowine.com/")
+(def base-uri "http://pasowine.com/wineries")
 
-(def *story-selector*
-     [[:div.story
-       (html/but :.advertisement)
-       (html/but :.autosStory)
-       (html/but :.adCreative)]])
+(def winery-selector [:table#winerylist :td :a])
 
-(def *headline-selector*
-     #{[html/root :> :h2 :a],
-       [html/root :> :h3 :a]
-       [html/root :> :h5 :a]})
+(defn fetch-uri [uri]
+  (html/html-resource (java.net.URI. uri)))
 
-(def *byline-selector* [html/root :> :.byline])
+(defn internal-winery-uri-extractor [winery]
+  (format "%s/%s" base-uri (-> winery :attrs :href)))
 
-(def *summary-selector* [html/root :> :.summary])
+(defn fetch-winery-list [uri]
+  "Extract the list of wineries contain each wineries link"
+  (map #(internal-winery-uri-extractor %)  (html/select (fetch-uri uri) winery-selector)))
 
-(defn fetch-url [url]
-  (html/html-resource (java.net.URL. url)))
+(defn winery-profile-extractor  [dom]
+  (-> (first  (html/select dom [:div#profile_content :p])) :content ))
 
-(defn stories []
-  (html/select (fetch-url *base-url*) *story-selector*))
+(defn winery-uri-extractor
+  "Get the third link tag contents"
+  [dom]
+  (-> (nth  (html/select dom [:div#profile_rightbar :p  :a]) 3) :content first))
 
-(defn extract [node]
-  (let [headline (first (html/select [node] *headline-selector*))
-        byline   (first (html/select [node] *byline-selector*))
-        summary  (first (html/select [node] *summary-selector*))
-        result   (map html/text [headline byline summary])]
-    (zipmap [:headline :byline :summary] (map #(re-gsub #"\n" "" %) result))))
+(defn wineries-doc-db
+  [region]
+  (clutch/get-database (format "wine-%s" region)))
 
-(defn empty-story? [node]
-  (every? (fn [[k v]] (= v "")) node))
+(defn extract-winery-data
+  "Extract the profile as well as the url to the wineries web site "
+  [{:keys [dom winery-id] :as settings}]
+  (let [ p (html/texts (winery-profile-extractor dom))
+        ;; First look for the italized "Website" text then look for the very next anchor tag then extract the address.
+        node (html/select dom { [[ :i (html/pred #(.contains (html/text %) "Website"))]]  [[:a (html/nth-of-type 1)]]})
+        u (first (:content (nth (first node) 2)))]
+    {:profile p
+     :uri u
+     :winery-id winery-id}))
 
-(defn check [story key default]
-  (let [v (key story)]
-   (if (not= v "") v default)))
+(defn mine-winery-data
+  "Contains the control flow logic for the asynchronous aspects of the program"
+  [{:keys [uri region] :as settings} ]
+  (let [doc-db (wineries-doc-db region)
+        ;; CHANNELS
+        retreive-channel (chan)
+        extract-channel (chan)
+        store-channel (chan)
+        channels [retreive-channel extract-channel store-channel]
+        ;; LAMBDA WIRING
+        retreive-fn (fn [uri]
+                      (let [id  (nth (first (re-seq #"winery=(\d+)" (query-of uri))) 1)
+                            d (fetch-uri uri)
+                            msg  {:dom d :winery-id id}]
+                        (go (>! extract-channel [:extract msg]))))
 
-(defn print-story [story]
-  (println)
-  (println (check story :headline "No headline"))
-  (println "\t" (check story :byline "No byline"))
-  (println "\t" (check story :summary "No summary")))
+        extract-fn (fn [data] (go (>! store-channel [:store (extract-winery-data data)])))
+        store-fn  (fn [data]  (clutch/with-db doc-db (clutch/put-document data)))
+        ;; DISTPATCH TABLE
+        dispatcher (fn [ch tuple]
+                     (let [[msg-token data] (take 2 tuple)]
+                       (match [msg-token]
+                              [:retreive] (retreive-fn data)
+                              [:extract] (extract-fn  data)
+                              [:store] (store-fn data))))]
+    (do
+      ;; PUT CHANNEL EVENTS INTO DISPATCHER
+      (go (while true
+            (let [[val ch] (alts! channels)]
+              (dispatcher ch val))))
+      ;; START PUSHING INPUT INTO SYSTEM
+      (map #(go (>! retreive-channel [:retreive %]))  (fetch-winery-list uri)) )))
 
-(defn print-stories []
-  (doseq [story (remove empty-story? (map extract (stories)))]
-    (print-story story)))
+(defplan mine-pasowine-com
+  []
+  (println "mining the wine"))
+
+;;(mine-winery-data {:uri base-uri :region "paso-robles"})
+;;(get-test-doc-db :prefix "wine" :username "paso-robles")
